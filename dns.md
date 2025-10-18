@@ -10,56 +10,11 @@ Chúng ta sẽ đi qua 2 phần chính:
 
 Trước khi bắt đầu, hãy xem sơ đồ dưới đây để hình dung script sẽ làm gì sau khi được cài đặt.
 
-*Sơ đồ 1: Luồng hoạt động của tác vụ sau khi máy tính khởi động.*
-
-```mermaid
-flowchart TD
-    A["Máy tính khởi động"] --> B{"Task Scheduler kích hoạt tác vụ"}
-    B --> C{"Chạy script PowerShell với quyền hệ thống cao nhất"}
-    C --> D["Script bắt đầu chạy ẩn"]
-    D --> E{"Chờ 10 giây cho mạng ổn định"}
-    E --> F{"Bắt đầu vòng lặp bảo vệ DNS trong 60 giây"}
-    
-    subgraph loop ["Vòng lặp kiểm tra mỗi 10 giây"]
-        direction TB
-        G["Kiểm tra DNS hiện tại"] --> H{"DNS có đúng với cấu hình không?"}
-        H -->|Không đúng| I["Sửa lại DNS cho đúng"]
-        H -->|Đúng| J["Không làm gì"]
-        I --> K["Chờ 10 giây rồi kiểm tra lại"]
-        J --> K
-    end
-    
-    F --> G
-    K --> L{"Đã hết 60 giây?"}
-    L -->|Không| G
-    L -->|Có| M["Tự động kết thúc script"]
-
-    %% Styling
-    classDef startEnd fill:#e1f5fe,stroke:#0277bd,stroke-width:2px,color:#000
-    classDef decision fill:#fff3e0,stroke:#f57c00,stroke-width:2px,color:#000
-    classDef process fill:#e8f5e8,stroke:#388e3c,stroke-width:2px,color:#000
-    classDef action fill:#fce4ec,stroke:#c2185b,stroke-width:2px,color:#000
-    
-    class A,M startEnd
-    class B,C,E,F,H,L decision
-    class D,G,K process
-    class I,J action
-```
-
----
-
 ### Phần 1: Cài đặt tác vụ
+##### Bước 1: Tạo file Script (.ps1)
 
-Bạn có thể chọn một trong hai phương pháp dưới đây. Phương pháp tự động nhanh và chính xác nhất.
-
-#### Phương pháp 1: Tự động (Khuyến nghị)
-
-Script gốc đã được thiết kế để tự làm mọi việc. Bạn chỉ cần chạy nó một lần duy nhất.
-
-1.  Mở **Windows PowerShell** với quyền quản trị viên (Run as Administrator).
-    *   Nhấn phím `Windows`, gõ `PowerShell`, nhấp chuột phải vào kết quả và chọn `Run as administrator`.
-2.  Sao chép (copy) toàn bộ khối mã dưới đây, dán (paste) vào cửa sổ PowerShell rồi nhấn `Enter`.
-
+1.  Mở trình soạn thảo văn bản như **Notepad**.
+2.  Sao chép **chỉ phần mã logic** dưới đây và dán vào Notepad.
 ```powershell
 # === SOFT-GUARD DNS: chỉ giữ 1 phút sau khi boot, sửa khi lệch, rồi thoát ===
 # ---- CONFIG ----
@@ -133,57 +88,6 @@ Write-Host "`nĐÃ cấu hình: DNS -> $($Servers -join ', ') | Task: $TaskName 
 Get-ScheduledTask -TaskName $TaskName | Select-Object TaskName,State,LastRunTime
 Get-DnsClientServerAddress -AddressFamily IPv4 | Select-Object InterfaceAlias,ServerAddresses
 ```
-
-**Xong!** Script sẽ tự động tạo tác vụ `ForceDNS_StartupWindow` trong Task Scheduler và áp dụng DNS ngay lập tức.
-
----
-
-#### Phương pháp 2: Thủ công (Để hiểu rõ quy trình)
-
-Phương pháp này chia làm 2 bước: tạo file script và cấu hình Task Scheduler bằng tay.
-
-##### Bước 1: Tạo file Script (.ps1)
-
-1.  Mở trình soạn thảo văn bản như **Notepad**.
-2.  Sao chép **chỉ phần mã logic** dưới đây và dán vào Notepad.
-    ```powershell
-    # Script này sẽ được Task Scheduler gọi
-    $ErrorActionPreference='SilentlyContinue';
-
-    # ---- Cấu hình cứng ----
-    $desired = @('8.8.8.8','8.8.4.4'); # DNS mong muốn
-    $InitialDelaySeconds = 10;
-    $WindowSeconds = 60;
-    $IntervalSeconds = 10;
-    # -------------------------
-
-    Start-Sleep -Seconds $InitialDelaySeconds;
-    $deadline = (Get-Date).AddSeconds($WindowSeconds);
-    $changed = $false;
-
-    do {
-      $up = Get-NetAdapter -EA SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
-      if ($up) {
-        $clients = Get-DnsClient -AddressFamily IPv4 -EA SilentlyContinue | Where-Object { $up.InterfaceAlias -contains $_.InterfaceAlias }
-        foreach ($c in $clients) {
-          try {
-            $cur = (Get-DnsClientServerAddress -InterfaceAlias $c.InterfaceAlias -AddressFamily IPv4 -EA SilentlyContinue).ServerAddresses
-            if (-not $cur -or ($cur -join ',') -ne ($desired -join ',')) {
-              try { Set-DnsClientServerAddress -InterfaceIndex $c.InterfaceIndex -ServerAddresses $desired -EA Stop }
-              catch {
-                & netsh interface ipv4 set dns name="$($c.InterfaceAlias)" static $desired[0] primary | Out-Null
-                for ($i=1; $i -lt $desired.Count; $i++) { & netsh interface ipv4 add dns name="$($c.InterfaceAlias)" address=$desired[$i] index=$($i+1) | Out-Null }
-              }
-              $changed = $true
-            }
-          } catch {}
-        }
-        if ($changed) { ipconfig /flushdns | Out-Null; $changed = $false }
-      }
-      if ((Get-Date) -ge $deadline) { break }
-      Start-Sleep -Seconds $IntervalSeconds
-    } while ($true)
-    ```
 3.  Lưu file lại:
     *   Chọn `File` -> `Save As...`.
     *   **Save as type:** Chọn `All Files (*.*)`.
@@ -255,36 +159,6 @@ Vậy là bạn đã hoàn tất việc cài đặt thủ công.
 ### Phần 2: Gỡ bỏ tác vụ (Khi không cần nữa)
 
 Khi bạn muốn gỡ bỏ chức năng này, cách đơn giản nhất là xóa tác vụ đã tạo trong Task Scheduler.
-
-#### Hướng dẫn Gỡ bỏ Thủ công qua Task Scheduler
-
-```mermaid
-flowchart TD
-    Start(("Bắt đầu")) --> A["Mở Task Scheduler<br/>(taskschd.msc)"]
-    A --> B["Vào 'Task Scheduler Library'"]
-    B --> C["Tìm tác vụ 'ForceDNS_StartupWindow'"]
-    C --> D{"Tìm thấy?"}
-    D -->|Có| E["Nhấp chuột phải → Chọn 'Delete'"]
-    E --> F["Xác nhận 'Yes'"]
-    F --> End(("Hoàn tất"))
-    D -->|Không| G["Tác vụ không tồn tại<br/>hoặc đã bị xóa"]
-    G --> End
-
-    %% Styling
-    classDef startEnd fill:#e1f5fe,stroke:#0277bd,stroke-width:3px,color:#000
-    classDef process fill:#e8f5e8,stroke:#388e3c,stroke-width:2px,color:#000
-    classDef decision fill:#fff3e0,stroke:#f57c00,stroke-width:2px,color:#000
-    classDef action fill:#fce4ec,stroke:#c2185b,stroke-width:2px,color:#000
-    classDef warning fill:#ffebee,stroke:#d32f2f,stroke-width:2px,color:#000
-    
-    class Start,End startEnd
-    class A,B,C process
-    class D decision
-    class E,F action
-    class G warning
-
-```
-*Sơ đồ 3: Quy trình gỡ bỏ tác vụ thủ công.*
 
 1.  **Mở Task Scheduler:** Nhấn `Windows + R`, gõ `taskschd.msc` và nhấn `Enter`.
 2.  **Tìm thư viện:** Ở khung bên trái, nhấp vào `Task Scheduler Library`.
