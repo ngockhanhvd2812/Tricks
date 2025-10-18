@@ -1,5 +1,3 @@
-Chuẩn bài “nhẹ nhàng tình cảm”: chỉ can thiệp **trong 1 phút đầu sau khi khởi động**, kiểm tra mỗi **10 giây**, **chỉ sửa khi thấy lệch**, xong là **thoát hẳn** (không lặp vĩnh viễn, không ghi Registry). Có thêm một cú trễ 10 giây cho mạng kịp lên.
-
 Dán nguyên khối vào **PowerShell (Run as Administrator)**:
 
 ```powershell
