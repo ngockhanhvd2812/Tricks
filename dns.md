@@ -1,81 +1,91 @@
-* Áp dụng ngay DNS `8.8.8.8, 8.8.4.4`
-* Ghi đè Scheduled Task để lần sau khởi động chờ 10s rồi tự áp dụng lại
+Chuẩn bài “nhẹ nhàng tình cảm”: chỉ can thiệp **trong 1 phút đầu sau khi khởi động**, kiểm tra mỗi **10 giây**, **chỉ sửa khi thấy lệch**, xong là **thoát hẳn** (không lặp vĩnh viễn, không ghi Registry). Có thêm một cú trễ 10 giây cho mạng kịp lên.
+
+Dán nguyên khối vào **PowerShell (Run as Administrator)**:
 
 ```powershell
-# === FORCE-ALL DNS (PS 5.1/7 compatible) ===
+# === SOFT-GUARD DNS: chỉ giữ 1 phút sau khi boot, sửa khi lệch, rồi thoát ===
 # ---- CONFIG ----
-$Servers              = @('8.8.8.8','8.8.4.4')   # ví dụ Cloudflare: @('1.1.1.1','1.0.0.1')
-$DelaySeconds         = 10                        # chờ nội bộ trước khi ép (sau boot/logon)
-$RepeatEveryMinutes   = 1                         # lặp lại để giữ kỷ luật
-$RepeatDurationHours  = 8                         # lặp trong 8 giờ
-$TaskName             = 'ForceDNS_All_Adapters_Hard'
+$Servers              = @('8.8.8.8','8.8.4.4')   # đổi tuỳ ý (Cloudflare: @('1.1.1.1','1.0.0.1'))
+$InitialDelaySeconds  = 10                        # chờ một chút cho mạng lên
+$WindowSeconds        = 60                        # bảo vệ trong 1 phút đầu sau khi boot
+$IntervalSeconds      = 10                        # kiểm tra mỗi 10s trong cửa sổ 1 phút
+$TaskName             = 'ForceDNS_StartupWindow'
 
-# ---- Lệnh chạy khi boot/logon (ép nhiều tầng + verify) ----
+# ---- Lệnh sẽ chạy lúc boot (nhẹ, chỉ sửa khi lệch) ----
 $serversLiteral = ($Servers | ForEach-Object { "'$_'" }) -join ','
 $template = @'
 $ErrorActionPreference='SilentlyContinue';
-Start-Sleep -Seconds __DELAY__;
-$servers=@(__SERVERS__);
+Start-Sleep -Seconds __INIT__;
+$desired=@(__SERVERS__);
+$deadline = (Get-Date).AddSeconds(__WIN__);
+$interval = __INT__;
+$changed  = $false
 
-# 1) Cmdlet hiện đại cho mọi IPv4 interface
-$ips = Get-NetIPInterface -AddressFamily IPv4 -EA SilentlyContinue
-foreach ($ip in $ips) {
-  try { Set-DnsClientServerAddress -InterfaceIndex $ip.InterfaceIndex -ServerAddresses $servers -EA Stop } catch {}
-}
-
-# 2) Fallback netsh theo alias (rắn hơn)
-$adapters = Get-NetAdapter -EA SilentlyContinue
-foreach ($ad in $adapters) {
-  try {
-    & netsh interface ipv4 set dns name="$($ad.InterfaceAlias)" static $servers[0] primary | Out-Null
-    for ($i=1; $i -lt $servers.Count; $i++) {
-      & netsh interface ipv4 add dns name="$($ad.InterfaceAlias)" address=$servers[$i] index=$($i+1) | Out-Null
+do {
+  # Chỉ xử lý adapter đang Up (Wi-Fi/Ethernet/VPN/VM ... đang hoạt động)
+  $up = Get-NetAdapter -EA SilentlyContinue | Where-Object { $_.Status -eq 'Up' }
+  if ($up) {
+    $clients = Get-DnsClient -AddressFamily IPv4 -EA SilentlyContinue | Where-Object {
+      $up.InterfaceAlias -contains $_.InterfaceAlias
     }
-  } catch {}
-}
 
-# 3) Ghi Registry NameServer cho mọi interface GUID
-foreach ($ad in $adapters) {
-  try {
-    $guid = $ad.InterfaceGuid
-    if ($null -ne $guid -and "$guid" -ne '') {
-      $key = "HKLM:\SYSTEM\CurrentControlSet\Services\Tcpip\Parameters\Interfaces\{$($guid)}"
-      New-Item -Path $key -Force | Out-Null
-      Set-ItemProperty -Path $key -Name NameServer -Value ($servers -join ',') -Force
+    foreach ($c in $clients) {
+      try {
+        $cur = (Get-DnsClientServerAddress -InterfaceAlias $c.InterfaceAlias -AddressFamily IPv4 -EA SilentlyContinue).ServerAddresses
+        if (-not $cur -or ($cur -join ',') -ne ($desired -join ',')) {
+          # Thử cmdlet hiện đại trước
+          try { Set-DnsClientServerAddress -InterfaceIndex $c.InterfaceIndex -ServerAddresses $desired -EA Stop }
+          catch {
+            # Nếu vẫn lệch, fallback netsh (chỉ cho alias đó)
+            & netsh interface ipv4 set dns name="$($c.InterfaceAlias)" static $desired[0] primary | Out-Null
+            for ($i=1; $i -lt $desired.Count; $i++) {
+              & netsh interface ipv4 add dns name="$($c.InterfaceAlias)" address=$desired[$i] index=$($i+1) | Out-Null
+            }
+          }
+          $changed = $true
+        }
+      } catch {}
     }
-  } catch {}
-}
+    if ($changed) { ipconfig /flushdns | Out-Null; $changed = $false }
+  }
 
-ipconfig /flushdns | Out-Null
+  if ((Get-Date) -ge $deadline) { break }
+  Start-Sleep -Seconds $interval
+} while ($true)
 '@
 
-$cmd = $template.Replace('__DELAY__',[string]$DelaySeconds).Replace('__SERVERS__',$serversLiteral)
+$cmd = $template.
+  Replace('__INIT__',[string]$InitialDelaySeconds).
+  Replace('__WIN__',[string]$WindowSeconds).
+  Replace('__INT__',[string]$IntervalSeconds).
+  Replace('__SERVERS__',$serversLiteral)
 
-# ---- Gỡ task cũ & đăng ký lại (Startup + Logon + lặp) ----
+# ---- Gỡ task cũ (nếu có) & đăng ký lại (AtStartup duy nhất) ----
 try { Unregister-ScheduledTask -TaskName $TaskName -Confirm:$false -EA SilentlyContinue } catch {}
 $action    = New-ScheduledTaskAction -Execute 'powershell.exe' -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$cmd`""
-$trStartup = New-ScheduledTaskTrigger -AtStartup
-$trLogon   = New-ScheduledTaskTrigger -AtLogOn
-$trRepeat  = New-ScheduledTaskTrigger -Once -At ((Get-Date).AddMinutes(1)) `
-              -RepetitionInterval (New-TimeSpan -Minutes $RepeatEveryMinutes) `
-              -RepetitionDuration (New-TimeSpan -Hours $RepeatDurationHours)
+$trigger   = New-ScheduledTaskTrigger -AtStartup               # không dùng -Delay để tương thích 5.1; delay nằm trong $cmd
 $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -RunLevel Highest
-$settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 10)
-Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger @($trStartup,$trLogon,$trRepeat) -Principal $principal -Settings $settings -Force | Out-Null
+$settings  = New-ScheduledTaskSettingsSet -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 5)
+Register-ScheduledTask -TaskName $TaskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force | Out-Null
 
-# ---- Áp dụng ngay lần đầu ----
+# ---- Áp dụng ngay lần đầu (khỏi chờ reboot) ----
 powershell -NoProfile -ExecutionPolicy Bypass -Command $cmd
 
-Write-Host "`nĐÃ ÉP DNS (tất cả adapter IPv4) -> $($Servers -join ', ') | Task: $TaskName (Startup + Logon + mỗi $RepeatEveryMinutes phút trong $RepeatDurationHours giờ)." -ForegroundColor Green
+Write-Host "`nĐÃ cấu hình: DNS -> $($Servers -join ', ') | Task: $TaskName (AtStartup, bảo vệ $WindowSeconds s, kiểm tra mỗi $IntervalSeconds s)." -ForegroundColor Green
 Get-ScheduledTask -TaskName $TaskName | Select-Object TaskName,State,LastRunTime
 Get-DnsClientServerAddress -AddressFamily IPv4 | Select-Object InterfaceAlias,ServerAddresses
-
 ```
 
-Kiểm tra nhanh: chạy
+### Kiểm tra nhanh
 
 ```powershell
 Get-DnsClientServerAddress -AddressFamily IPv4 | Select InterfaceAlias,ServerAddresses
 ```
 
-Bạn sẽ thấy mỗi card có hai server theo thứ tự `8.8.8.8, 8.8.4.4`. Windows sẽ ưu tiên cái đầu, gặp lỗi mới thử cái sau. Nếu đang trong môi trường domain/VPN có DNS nội bộ, cân nhắc giữ bộ lọc `$IgnoreRegex` như trên để khỏi “phá” phân giải tên nội bộ. Muốn mình thêm IPv6 (2001:4860:4860::8888/8844) hoặc chỉ áp dụng cho “Wi-Fi”/“Ethernet”, mình nhúng thêm giúp bạn được ngay.
+### Gỡ bỏ (khi không cần nữa)
+
+```powershell
+Unregister-ScheduledTask -TaskName 'ForceDNS_StartupWindow' -Confirm:$false
+```
+
+Bạn có thể tinh chỉnh “độ dịu”: tăng `IntervalSeconds` (ít kiểm tra hơn) hoặc giảm `WindowSeconds` (ngắn hơn), nhưng với 10s/60s như trên, máy gần như không cảm nhận được overhead. Nếu sau này bạn dùng VPN nào “đổi DNS muộn hơn 1 phút”, mình có thể chuyển sang bản **event-driven** (chỉ chạy ngay khi mạng/VPN kết nối) — vẫn mềm mà chuẩn.
